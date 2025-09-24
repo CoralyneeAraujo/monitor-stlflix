@@ -1,0 +1,4 @@
+node_modules
+schema.db
+.env
+/data
