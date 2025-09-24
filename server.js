@@ -20,6 +20,9 @@ const ACCEPT_3XX_AS_SUCCESS = true; // <<< deixe true para considerar 3xx OK
 const FOLLOW_REDIRECTS = true; // você já tem; mantive aqui só para referência
 const MAX_REDIRECTS = 5;
 
+// ADDED: retenção configurável em horas (default 24)
+const LOG_RETENTION_HOURS = Number(process.env.LOG_RETENTION_HOURS || 24);
+
 app.use(cors());
 app.use(express.json());
 
@@ -253,6 +256,48 @@ app.delete("/api/logs", (req, res) => {
   }
 });
 
+// --- logs: suporta filtro since=today e sinceHours=NN ---
+app.get("/api/logs", (req, res) => {
+  const id = Number(req.query.targetId);
+  const limit = Math.min(Number(req.query.limit ?? 100), 1000);
+  const since = String(req.query.since || "").toLowerCase(); // ex.: "today"
+  const sinceHours = Number(req.query.sinceHours || 0); // ex.: 12
+
+  if (!id) return res.status(400).json({ error: "targetId obrigatório" });
+
+  try {
+    if (since === "today") {
+      const rows = db.prepare(`
+        SELECT * FROM checks
+        WHERE target_id = ?
+          AND ts >= DATETIME('now','start of day')
+        ORDER BY id DESC
+        LIMIT ?
+      `).all(id, limit);
+      return res.json(rows);
+    }
+
+    if (Number.isFinite(sinceHours) && sinceHours > 0) {
+      const rows = db.prepare(`
+        SELECT * FROM checks
+        WHERE target_id = ?
+          AND ts >= DATETIME('now', ?)
+        ORDER BY id DESC
+        LIMIT ?
+      `).all(id, `-${sinceHours} hours`, limit);
+      return res.json(rows);
+    }
+
+    // comportamento padrão (sem filtros)
+    return res.json(q.recentChecksByTarget.all(id, limit));
+  } catch (e) {
+    console.error("GET /api/logs failed:", e);
+    return res
+      .status(500)
+      .json({ error: "failed_to_fetch_logs", detail: String(e) });
+  }
+});
+
 app.get("/api/targets", (_req, res) => res.json(q.listTargets.all()));
 
 app.post("/api/targets", (req, res) => {
@@ -326,13 +371,6 @@ app.delete("/api/targets/:id", (req, res) => {
       .status(500)
       .json({ error: "failed_to_delete_target", detail: String(e) });
   }
-});
-
-app.get("/api/logs", (req, res) => {
-  const id = Number(req.query.targetId);
-  const limit = Math.min(Number(req.query.limit ?? 100), 1000);
-  if (!id) return res.status(400).json({ error: "targetId obrigatório" });
-  res.json(q.recentChecksByTarget.all(id, limit));
 });
 
 app.get("/api/summary", (_req, res) => {
@@ -507,7 +545,6 @@ async function doCheck(t) {
       putCookies(res);
 
       // 3xx?
-      // 3xx?
       if (status >= 300 && status < 400) {
         const loc = res.headers.get("location");
         const nextAbs = loc ? new URL(loc, currentUrl).toString() : "";
@@ -517,8 +554,6 @@ async function doCheck(t) {
         if (ACCEPT_3XX_AS_SUCCESS || inRange(status, range)) {
           ok = true;
           matched = true;
-          // opcional: registrar o destino para referência
-          // err = nextAbs ? `redirect to ${nextAbs}` : null;
           break;
         }
 
@@ -659,6 +694,26 @@ setInterval(() => {
     }
   }
 }, 300);
+
+// --- ADDED: retenção de logs (limpeza automática a cada 1h) ---
+setInterval(() => {
+  try {
+    // apaga checks mais antigos que LOG_RETENTION_HOURS
+    db.prepare(`
+      DELETE FROM checks
+      WHERE ts < DATETIME('now', ?)
+    `).run(`-${LOG_RETENTION_HOURS} hours`);
+
+    // apaga incidents encerrados mais antigos que LOG_RETENTION_HOURS (opcional)
+    db.prepare(`
+      DELETE FROM incidents
+      WHERE ended_at IS NOT NULL
+        AND ended_at < DATETIME('now', ?)
+    `).run(`-${LOG_RETENTION_HOURS} hours`);
+  } catch (e) {
+    console.error("Erro ao limpar logs antigos:", e);
+  }
+}, 60 * 60 * 1000); // a cada 1 hora
 
 // --- logs de erro úteis ---
 server.on("error", (err) => console.error("Erro ao subir servidor:", err));
