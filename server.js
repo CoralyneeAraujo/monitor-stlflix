@@ -16,12 +16,28 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
 const app = express();
-const ACCEPT_3XX_AS_SUCCESS = true; // <<< deixe true para considerar 3xx OK
-const FOLLOW_REDIRECTS = true; // você já tem; mantive aqui só para referência
+const ACCEPT_3XX_AS_SUCCESS = true;
+const FOLLOW_REDIRECTS = true;
 const MAX_REDIRECTS = 5;
 
-// ADDED: retenção configurável em horas (default 24)
+// retenção configurável (padrão 24h)
 const LOG_RETENTION_HOURS = Number(process.env.LOG_RETENTION_HOURS || 24);
+
+// --- proxy + CORS/preflight (evita 405 no POST/WS) ---
+app.set("trust proxy", 1);
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*"); // troque por teu domínio se quiser restringir
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PATCH,DELETE,OPTIONS"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
+  if (req.method === "OPTIONS") return res.sendStatus(204); // responde preflight
+  next();
+});
 
 app.use(cors());
 app.use(express.json());
@@ -32,7 +48,7 @@ const INDEX_HTML = path.join(PUBLIC_DIR, "index.html");
 console.log("[static] PUBLIC_DIR:", PUBLIC_DIR);
 console.log("[static] INDEX_HTML exists?", fs.existsSync(INDEX_HTML));
 app.use(express.static(PUBLIC_DIR, { index: "index.html", fallthrough: true }));
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   if (!fs.existsSync(INDEX_HTML))
     return res.status(500).send(`index.html não encontrado em: ${INDEX_HTML}`);
   res.sendFile(INDEX_HTML);
@@ -44,11 +60,9 @@ let db;
 try {
   db = new Database(DB_PATH, { timeout: 5000 }); // espera lock até 5s
   db.pragma("busy_timeout = 5000");
-  db.pragma("foreign_keys = ON"); // <=== importante!
+  db.pragma("foreign_keys = ON");
   try {
-    const mode = String(
-      db.pragma("journal_mode", { simple: true })
-    ).toUpperCase();
+    const mode = String(db.pragma("journal_mode", { simple: true })).toUpperCase();
     if (mode !== "WAL") db.pragma("journal_mode = WAL", { simple: true });
   } catch (e) {
     console.warn("WAL indisponível, seguindo com journal padrão:", e.message);
@@ -68,23 +82,18 @@ function validateAbsoluteHttpUrl(u) {
   const parsed = new URL(u);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
     throw new Error("Apenas http:// ou https:// são suportados");
-  return parsed.toString(); // normaliza
+  return parsed.toString();
 }
-// normaliza URL para detectar loops mesmo com/sem barra final e sem query/hash
 function canon(u) {
   const a = new URL(u);
   a.hash = "";
   a.search = "";
-  a.pathname = a.pathname.replace(/\/+$/, ""); // remove barra final
+  a.pathname = a.pathname.replace(/\/+$/, "");
   return a.origin + a.pathname;
 }
-
-// extrai Set-Cookie de forma compatível com Node 18+/20+
 function getSetCookieList(res) {
   try {
-    if (typeof res.headers.getSetCookie === "function") {
-      return res.headers.getSetCookie(); // Node 20+
-    }
+    if (typeof res.headers.getSetCookie === "function") return res.headers.getSetCookie(); // Node 20+
     if (res.headers.raw) {
       const raw = res.headers.raw()["set-cookie"];
       return Array.isArray(raw) ? raw : [];
@@ -95,21 +104,16 @@ function getSetCookieList(res) {
     return [];
   }
 }
-
 function statusRange(t) {
-  const min = Number.isFinite(+t.expected_status_min)
-    ? +t.expected_status_min
-    : 200;
-  const max = Number.isFinite(+t.expected_status_max)
-    ? +t.expected_status_max
-    : 299;
+  const min = Number.isFinite(+t.expected_status_min) ? +t.expected_status_min : 200;
+  const max = Number.isFinite(+t.expected_status_max) ? +t.expected_status_max : 299;
   return { min, max };
 }
 function inRange(status, { min, max }) {
   return typeof status === "number" && status >= min && status <= max;
 }
 
-// --- schema (com IF NOT EXISTS) ---
+// --- schema (IF NOT EXISTS) ---
 db.exec(`
 CREATE TABLE IF NOT EXISTS targets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,17 +209,12 @@ app.post("/api/monitor/resume", (_req, res) => {
   res.json({ paused: false });
 });
 
-// --- alvo: pausar/retomar (toggle enabled) ---
+// --- alvo: pausar/retomar ---
 app.post("/api/targets/:id/pause", (req, res) => {
   const id = Number(req.params.id);
   const cur = q.getTarget.get(id);
   if (!cur) return res.sendStatus(404);
-  q.updateTarget.run({
-    ...cur,
-    enabled: 0,
-    id,
-    headers_json: cur.headers_json,
-  });
+  q.updateTarget.run({ ...cur, enabled: 0, id, headers_json: cur.headers_json });
   broadcast({ kind: "control", scope: "target", targetId: id, enabled: 0 });
   res.json(q.getTarget.get(id));
 });
@@ -223,17 +222,12 @@ app.post("/api/targets/:id/resume", (req, res) => {
   const id = Number(req.params.id);
   const cur = q.getTarget.get(id);
   if (!cur) return res.sendStatus(404);
-  q.updateTarget.run({
-    ...cur,
-    enabled: 1,
-    id,
-    headers_json: cur.headers_json,
-  });
+  q.updateTarget.run({ ...cur, enabled: 1, id, headers_json: cur.headers_json });
   broadcast({ kind: "control", scope: "target", targetId: id, enabled: 1 });
   res.json(q.getTarget.get(id));
 });
 
-// --- API ---
+// --- health ---
 app.get("/ping", (_req, res) =>
   res.json({ ok: true, ts: new Date().toISOString() })
 );
@@ -256,12 +250,12 @@ app.delete("/api/logs", (req, res) => {
   }
 });
 
-// --- logs: suporta filtro since=today e sinceHours=NN ---
+// --- logs com filtros since=today e sinceHours=NN ---
 app.get("/api/logs", (req, res) => {
   const id = Number(req.query.targetId);
   const limit = Math.min(Number(req.query.limit ?? 100), 1000);
-  const since = String(req.query.since || "").toLowerCase(); // ex.: "today"
-  const sinceHours = Number(req.query.sinceHours || 0); // ex.: 12
+  const since = String(req.query.since || "").toLowerCase(); // "today"
+  const sinceHours = Number(req.query.sinceHours || 0); // NN
 
   if (!id) return res.status(400).json({ error: "targetId obrigatório" });
 
@@ -288,7 +282,7 @@ app.get("/api/logs", (req, res) => {
       return res.json(rows);
     }
 
-    // comportamento padrão (sem filtros)
+    // padrão
     return res.json(q.recentChecksByTarget.all(id, limit));
   } catch (e) {
     console.error("GET /api/logs failed:", e);
@@ -306,10 +300,8 @@ app.post("/api/targets", (req, res) => {
     if (!d.name || !d.url)
       return res.status(400).json({ error: "name e url são obrigatórios" });
 
-    // valida: você precisa informar http:// ou https:// manualmente
     d.url = validateAbsoluteHttpUrl(d.url);
 
-    // anti-duplicado por url+method
     const exists = q.findByUrlAndMethod.get(d.url, d.method ?? "GET");
     if (exists)
       return res.status(409).json({
@@ -360,7 +352,6 @@ app.patch("/api/targets/:id", (req, res) => {
 app.delete("/api/targets/:id", (req, res) => {
   const id = Number(req.params.id);
   try {
-    // apaga dependências primeiro (funciona mesmo sem CASCADE)
     db.prepare("DELETE FROM checks WHERE target_id = ?").run(id);
     db.prepare("DELETE FROM incidents WHERE target_id = ?").run(id);
     q.deleteTarget.run(id);
@@ -397,8 +388,15 @@ const server = app.listen(PORT, HOST, () => {
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// envia estado/saudação quando um cliente conecta
+// WS: saudação + keep-alive (ping)
 wss.on("connection", (socket) => {
+  // keep-alive a cada 25s (para proxies que cortam conexões ociosas)
+  const keepAlive = setInterval(() => {
+    try { socket.ping(); } catch {}
+  }, 25000);
+
+  socket.on("close", () => clearInterval(keepAlive));
+
   socket.send(
     JSON.stringify({ kind: "control", scope: "global", paused: MONITOR_PAUSED })
   );
@@ -444,43 +442,22 @@ async function doCheck(t) {
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), t.timeout_ms);
 
-  let ok = false,
-    status = 0,
-    err = null,
-    matched = false;
+  let ok = false, status = 0, err = null, matched = false;
 
-  // 1) valida URL inicial (exige http/https explicitamente)
+  // valida URL inicial (exige http/https)
   let currentUrl;
   try {
     currentUrl = validateAbsoluteHttpUrl(t.url);
   } catch {
     const tsIso = new Date().toISOString();
-    q.insertCheck.run(
-      t.id,
-      tsIso,
-      null,
-      0,
-      0,
-      "Invalid URL (precisa http:// ou https://)",
-      0
-    );
-    broadcast({
-      kind: "log",
-      targetId: t.id,
-      name: t.name,
-      url: t.url,
-      ok: false,
-      status: null,
-      rt: 0,
-      err: "Invalid URL",
-      ts: tsIso,
-    });
+    q.insertCheck.run(t.id, tsIso, null, 0, 0, "Invalid URL (precisa http:// ou https://)", 0);
+    broadcast({ kind: "log", targetId: t.id, name: t.name, url: t.url, ok: false, status: null, rt: 0, err: "Invalid URL", ts: tsIso });
     clearTimeout(to);
     return;
   }
   const range = statusRange(t);
 
-  // 2) cookie jar simples (para redirecionamentos que dependem de cookie de sessão/locale)
+  // cookie jar simples
   const jar = {};
   function putCookies(res) {
     const list = getSetCookieList(res);
@@ -490,49 +467,23 @@ async function doCheck(t) {
       if (i > 0) jar[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
     }
   }
-  const jarHeader = () =>
-    Object.entries(jar)
-      .map(([k, v]) => `${k}=${v}`)
-      .join("; ");
+  const jarHeader = () => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ");
 
-  // 3) cadeia de redirects + detecção de loop por URL canônica
   const chain = [currentUrl];
   const seen = new Set([canon(currentUrl)]);
-
-  // helper: último tiro com follow (quando permitido) para tentar chegar no 200
-  const finalFollow = async (baseHeaders, urlToFollow) => {
-    const res2 = await fetch(urlToFollow, {
-      method: t.method,
-      signal: controller.signal,
-      redirect: "follow",
-      headers: baseHeaders,
-      body: t.body ?? undefined,
-    });
-    status = res2.status;
-    const bodyStr = t.expected_body_contains ? await res2.text() : "";
-    matched = t.expected_body_contains
-      ? bodyStr.includes(t.expected_body_contains)
-      : true;
-    ok =
-      status >= t.expected_status_min &&
-      status <= t.expected_status_max &&
-      matched;
-  };
 
   try {
     for (let hops = 0; hops <= MAX_REDIRECTS; hops++) {
       const baseHeaders = {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Caroline-Monitor/1.0",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Caroline-Monitor/1.0",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
         "Upgrade-Insecure-Requests": "1",
         ...JSON.parse(t.headers_json || "{}"),
       };
       if (Object.keys(jar).length) baseHeaders.Cookie = jarHeader();
 
-      // Tentativa "manual" (não segue 3xx aqui)
+      // tentativa manual (não segue 3xx)
       const res = await fetch(currentUrl, {
         method: t.method,
         signal: controller.signal,
@@ -544,43 +495,22 @@ async function doCheck(t) {
       status = res.status;
       putCookies(res);
 
-      // 3xx?
+      // 3xx
       if (status >= 300 && status < 400) {
         const loc = res.headers.get("location");
         const nextAbs = loc ? new URL(loc, currentUrl).toString() : "";
 
-        // Se você aceita 3xx como sucesso OU configurou a faixa para incluir 3xx,
-        // encerra aqui como OK (não segue).
         if (ACCEPT_3XX_AS_SUCCESS || inRange(status, range)) {
-          ok = true;
-          matched = true;
-          break;
+          ok = true; matched = true; break;
         }
-
-        // Caso contrário, só registra e encerra se FOLLOW_REDIRECTS estiver desligado
         if (!FOLLOW_REDIRECTS) {
-          err = `redirected to ${nextAbs || "(sem Location)"}`;
-          matched = false;
-          break;
+          err = `redirected to ${nextAbs || "(sem Location)"}`; matched = false; break;
         }
-
-        // --- seguir redirect (com proteção de loop e limite) ---
-        if (!nextAbs) {
-          err = "redirect without Location";
-          break;
-        }
+        if (!nextAbs) { err = "redirect without Location"; break; }
 
         const key = canon(nextAbs);
-        if (seen.has(key)) {
-          // loop detectado — chega!
-          err = `redirect loop detected: ${[...chain, nextAbs].join(" → ")}`;
-          break;
-        }
-
-        if (hops === MAX_REDIRECTS) {
-          err = `redirect count exceeded: ${[...chain, nextAbs].join(" → ")}`;
-          break;
-        }
+        if (seen.has(key)) { err = `redirect loop detected: ${[...chain, nextAbs].join(" → ")}`; break; }
+        if (hops === MAX_REDIRECTS) { err = `redirect count exceeded: ${[...chain, nextAbs].join(" → ")}`; break; }
 
         seen.add(key);
         chain.push(nextAbs);
@@ -588,28 +518,17 @@ async function doCheck(t) {
         continue;
       }
 
-      // status final (não-3xx)
+      // final
       const bodyStr = t.expected_body_contains ? await res.text() : "";
-      matched = t.expected_body_contains
-        ? bodyStr.includes(t.expected_body_contains)
-        : true;
+      matched = t.expected_body_contains ? bodyStr.includes(t.expected_body_contains) : true;
       ok = inRange(status, range) && matched;
-      ok =
-        status >= t.expected_status_min &&
-        status <= t.expected_status_max &&
-        matched;
+      ok = status >= t.expected_status_min && status <= t.expected_status_max && matched;
       break;
     }
   } catch (e) {
     const c = e?.cause || {};
-    const parts = [
-      c.code,
-      c.hostname || c.address,
-      c.port && `:${c.port}`,
-      c.message,
-    ].filter(Boolean);
-    if (!err)
-      err = `fetch failed${parts.length ? " - " + parts.join(" ") : ""}`;
+    const parts = [c.code, c.hostname || c.address, c.port && `:${c.port}`, c.message].filter(Boolean);
+    if (!err) err = `fetch failed${parts.length ? " - " + parts.join(" ") : ""}`;
   } finally {
     clearTimeout(to);
   }
@@ -617,35 +536,14 @@ async function doCheck(t) {
   const rt = Date.now() - startedAt;
   const tsIso = new Date().toISOString();
 
-  // grava no banco
-  q.insertCheck.run(
-    t.id,
-    tsIso,
-    status || null,
-    ok ? 1 : 0,
-    rt,
-    err,
-    matched ? 1 : 0
-  );
+  // grava log
+  q.insertCheck.run(t.id, tsIso, status || null, ok ? 1 : 0, rt, err, matched ? 1 : 0);
 
   // envia pro front
-  broadcast({
-    kind: "log",
-    targetId: t.id,
-    name: t.name,
-    url: currentUrl,
-    ok,
-    status,
-    rt,
-    err,
-    ts: tsIso,
-  });
+  broadcast({ kind: "log", targetId: t.id, name: t.name, url: currentUrl, ok, status, rt, err, ts: tsIso });
 
   // incidentes (abre/fecha)
-  const recent = q.recentChecksByTarget.all(
-    t.id,
-    Math.max(Number(t.retries) || 1, 3)
-  );
+  const recent = q.recentChecksByTarget.all(t.id, Math.max(Number(t.retries) || 1, 3));
   const consecutiveFails = recent.length > 0 && recent.every((r) => r.ok === 0);
   const open = q.lastIncidentOpen.get(t.id);
   if (consecutiveFails && !open) {
@@ -659,33 +557,21 @@ async function doCheck(t) {
 }
 
 setInterval(() => {
-  if (MONITOR_PAUSED) return; // pausa global
+  if (MONITOR_PAUSED) return;
   scheduleAll();
   const now = Date.now();
   for (const [id, nextDue] of running) {
     const t = q.getTarget.get(id);
-    if (!t || !t.enabled) {
-      running.delete(id);
-      continue;
-    }
+    if (!t || !t.enabled) { running.delete(id); continue; }
     if (inFlight >= MAX_CONCURRENCY) break;
-
-    // evita duplicar: se já está rodando, pula
     if (RUNNING_NOW.has(id)) continue;
 
     if (now >= nextDue) {
-      // marca próximo vencimento ANTES de rodar, e trava o alvo
       running.set(id, now + t.interval_sec * 1000);
       RUNNING_NOW.add(id);
 
       inFlight++;
-      broadcast({
-        kind: "tick",
-        targetId: id,
-        name: t.name,
-        url: t.url,
-        ts: new Date().toISOString(),
-      });
+      broadcast({ kind: "tick", targetId: id, name: t.name, url: t.url, ts: new Date().toISOString() });
 
       doCheck(t).finally(() => {
         inFlight--;
@@ -695,16 +581,10 @@ setInterval(() => {
   }
 }, 300);
 
-// --- ADDED: retenção de logs (limpeza automática a cada 1h) ---
+// --- limpeza automática (a cada 1h) ---
 setInterval(() => {
   try {
-    // apaga checks mais antigos que LOG_RETENTION_HOURS
-    db.prepare(`
-      DELETE FROM checks
-      WHERE ts < DATETIME('now', ?)
-    `).run(`-${LOG_RETENTION_HOURS} hours`);
-
-    // apaga incidents encerrados mais antigos que LOG_RETENTION_HOURS (opcional)
+    db.prepare(`DELETE FROM checks WHERE ts < DATETIME('now', ?)`).run(`-${LOG_RETENTION_HOURS} hours`);
     db.prepare(`
       DELETE FROM incidents
       WHERE ended_at IS NOT NULL
@@ -713,7 +593,7 @@ setInterval(() => {
   } catch (e) {
     console.error("Erro ao limpar logs antigos:", e);
   }
-}, 60 * 60 * 1000); // a cada 1 hora
+}, 60 * 60 * 1000);
 
 // --- logs de erro úteis ---
 server.on("error", (err) => console.error("Erro ao subir servidor:", err));
