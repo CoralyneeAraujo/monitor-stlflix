@@ -171,9 +171,10 @@
 
   <script>
     'use strict';
-    const API_BASE = /^https?:\/\//.test(location.origin) ? location.origin : 'http://localhost:3000';
-    const api = (p, opts={}) => fetch(API_BASE + p, opts);
-    const wsUrl = () => API_BASE.replace(/^http/,'ws') + '/ws';
+    // usa sempre o mesmo host do front (Railway ou local)
+	const api = (p, opts = {}) => fetch(p, opts);
+// wss em https, ws em http
+	const wsUrl = () => location.origin.replace(/^http/, 'ws') + '/ws';
 
     const cardsEl = document.getElementById('cards');
     const emptyEl = document.getElementById('empty');
